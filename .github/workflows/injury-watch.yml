@@ -1,0 +1,28 @@
+name: Injury Watch
+
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: injury-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 130
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v1
+        with:
+          deno-version: v2.x
+
+      - name: Run injury watch
+        working-directory: injury-watch
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: deno run --allow-net --allow-env --allow-run=curl run.ts
