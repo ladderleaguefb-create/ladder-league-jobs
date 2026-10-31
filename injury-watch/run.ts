@@ -6,14 +6,60 @@ const supabase = createClient(
 )
 
 const FEED = 'https://site.api.espn.com/apis/site/v2/sports/football/nfl/injuries'
+const FUNCTION_NAME = 'injury-watch'
 const LOOK_AHEAD_MIN = 110   // watch games kicking off within this many minutes
 const POLL_EVERY_MIN = 3     // how often to check ESPN during a watch
 const MAX_RUNTIME_MIN = 120  // safety stop
 const MIN_FEED_SIZE = 100    // fewer entries than this = ESPN hiccup, don't trust it
+const SUMMARY_HOUR_CT = 8    // daily summary goes out at the first run after 8 AM Central
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
-// Download the ESPN feed with curl (ESPN blocks Supabase's servers, not GitHub's).
+// ── Email (same Resend setup as the other jobs) ──
+async function sendEmail(subject: string, body: string): Promise<void> {
+  const key = Deno.env.get('RESEND_API_KEY')
+  if (!key) {
+    console.error('RESEND_API_KEY not set - skipping email')
+    return
+  }
+  try {
+    await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: 'Ladder League <notifications@ladderleague.us>',
+        to: ['andrewjkinn@gmail.com', 'lucastopolie@gmail.com', 'ladderleaguefb@gmail.com'],
+        subject,
+        text: body,
+      }),
+    })
+  } catch (err) {
+    console.error('Failed to send email:', err)
+  }
+}
+
+// Log a failed check. Email only when this is the first failure in a row,
+// so an outage sends one alert instead of one every few minutes.
+async function recordError(error: unknown): Promise<void> {
+  const { data: last } = await supabase
+    .from('espn_injury_runs')
+    .select('error')
+    .order('id', { ascending: false })
+    .limit(1)
+  const alreadyFailing = !!(last && last.length > 0 && last[0].error)
+
+  await supabase.from('espn_injury_runs').insert({ error: String(error) })
+
+  if (!alreadyFailing) {
+    await sendEmail(
+      '❌ injury-watch: checks are failing',
+      `The injury check failed:\n\n${String(error)}\n\n` +
+      `You'll get this email once per outage. The daily summary will show when checks are back to normal.`
+    )
+  }
+}
+
+// ── ESPN ──
 async function fetchFeed(): Promise<any> {
   const out = await new Deno.Command('curl', {
     args: [
@@ -85,7 +131,6 @@ async function checkOnce(players: Map<string, any>): Promise<void> {
     }
   }
 
-  // A tiny feed is almost certainly an ESPN hiccup, not "everyone is healthy".
   if (feedSize < MIN_FEED_SIZE) {
     throw new Error(`ESPN feed only had ${feedSize} entries; skipping this check`)
   }
@@ -118,32 +163,103 @@ async function checkOnce(players: Map<string, any>): Promise<void> {
   console.log(`${new Date().toISOString()} feed=${feedSize} changes=${changes.length}`)
 }
 
+// ── Daily summary ──
+function centralHour(d: Date): number {
+  return parseInt(d.toLocaleString('en-US', { timeZone: 'America/Chicago', hour: 'numeric', hour12: false }), 10) % 24
+}
+
+async function maybeSendDailySummary(): Promise<void> {
+  const now = new Date()
+  if (centralHour(now) < SUMMARY_HOUR_CT) return
+
+  // Already sent one in the last 20 hours?
+  const since20h = new Date(now.getTime() - 20 * 3600000).toISOString()
+  const { data: sent } = await supabase
+    .from('function_run_log')
+    .select('id')
+    .eq('function_name', FUNCTION_NAME)
+    .gte('completed_at', since20h)
+    .limit(1)
+  if (sent && sent.length > 0) return
+
+  const since24h = new Date(now.getTime() - 24 * 3600000).toISOString()
+
+  const { data: runs } = await supabase
+    .from('espn_injury_runs')
+    .select('error')
+    .gte('checked_at', since24h)
+  const checks = runs?.length ?? 0
+  const errors = (runs ?? []).filter((r: any) => r.error).length
+
+  const { data: watches } = await supabase
+    .from('injury_watch_dispatches')
+    .select('id')
+    .gte('dispatched_at', since24h)
+
+  const { data: changes } = await supabase
+    .from('player_status_changes')
+    .select('old_value, new_value, changed_at, players(full_name, team_name, position)')
+    .eq('kind', 'injury')
+    .gte('changed_at', since24h)
+    .order('changed_at', { ascending: true })
+
+  const all = changes ?? []
+  const notable = all.filter((c: any) => c.new_value === 'Out' || c.new_value === 'Doubtful')
+  const line = (c: any) =>
+    `${c.players?.full_name ?? 'Unknown'} (${c.players?.team_name ?? '?'} ${c.players?.position ?? ''}): ` +
+    `${c.old_value ?? 'healthy'} -> ${c.new_value ?? 'healthy'}`
+
+  const healthy = errors === 0 && checks > 0
+  await sendEmail(
+    `${healthy ? '✅' : '🟡'} injury-watch: daily summary`,
+    `Last 24 hours:\n\n` +
+    `Checks run: ${checks}\n` +
+    `Failed checks: ${errors}\n` +
+    `Game-day watches started: ${watches?.length ?? 0}\n` +
+    `Player status changes: ${all.length}\n` +
+    (notable.length > 0 ? `\nNow Out or Doubtful:\n  → ${notable.map(line).join('\n  → ')}\n` : '')
+  )
+
+  await supabase.from('function_run_log').insert({
+    function_name: FUNCTION_NAME,
+    scheduled_for: now.toISOString(),
+    status: 'success',
+    completed_at: now.toISOString(),
+    summary: { checks, errors, watches: watches?.length ?? 0, changes: all.length },
+  })
+}
+
+// ── Main ──
 async function main() {
   const players = await loadPlayers()
   const stopAt = await getStopAt()
 
-  // No games soon: one check (hourly runs pick up weekday injury reports).
   if (!stopAt) {
-    await checkOnce(players)
-    return
-  }
-
-  // Games soon: keep checking until they kick off.
-  console.log(`Watching until ${new Date(stopAt).toISOString()}`)
-  const started = Date.now()
-  while (true) {
+    // No games soon: one check (hourly runs pick up weekday injury reports).
     try {
       await checkOnce(players)
     } catch (error) {
-      // One bad check shouldn't end the watch; log it and try again next time.
       console.error('check failed:', error)
-      await supabase.from('espn_injury_runs').insert({ error: String(error) })
+      await recordError(error)
     }
-
-    const now = Date.now()
-    if (now >= stopAt || now - started >= MAX_RUNTIME_MIN * 60000) break
-    await sleep(Math.min(POLL_EVERY_MIN * 60000, stopAt - now))
+  } else {
+    // Games soon: keep checking until they kick off.
+    console.log(`Watching until ${new Date(stopAt).toISOString()}`)
+    const started = Date.now()
+    while (true) {
+      try {
+        await checkOnce(players)
+      } catch (error) {
+        console.error('check failed:', error)
+        await recordError(error)
+      }
+      const now = Date.now()
+      if (now >= stopAt || now - started >= MAX_RUNTIME_MIN * 60000) break
+      await sleep(Math.min(POLL_EVERY_MIN * 60000, stopAt - now))
+    }
   }
+
+  await maybeSendDailySummary()
   console.log('Done.')
 }
 
@@ -151,6 +267,6 @@ try {
   await main()
 } catch (error) {
   console.error('injury-watch error:', error)
-  await supabase.from('espn_injury_runs').insert({ error: String(error) })
+  await recordError(error)
   Deno.exit(1)
 }
